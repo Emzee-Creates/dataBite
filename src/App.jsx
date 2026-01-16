@@ -9,6 +9,7 @@ import DataTable from './components/DataTable';
 import Visualizer from './components/Visualizer';
 import VoiceInterface from './components/VoiceInterface';
 import { generateChartConfig, getDiscoverySuggestions } from './utils/aiLogic';
+import { supabase } from './utils/supabaseClient'; // Ensure this file exists
 
 const Dashboard = () => {
   const [dataset, setDataset] = useState(null);
@@ -18,18 +19,32 @@ const Dashboard = () => {
   const [history, setHistory] = useState([]);
   const [suggestions, setSuggestions] = useState([]);
 
-  // --- IMPROVED KEYBOARD LOGIC ---
+  // --- NEW: FETCH HISTORY FROM SUPABASE ON LOAD ---
+  useEffect(() => {
+    const fetchHistory = async () => {
+      const { data, error } = await supabase
+        .from('insights')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(10);
+      
+      if (error) console.error("Error fetching history:", error);
+      else if (data) setHistory(data);
+    };
+
+    fetchHistory();
+  }, []);
+
+  // --- KEYBOARD LOGIC ---
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT' && dataset) {
         e.preventDefault(); 
-        e.stopImmediatePropagation(); // Prevents double-triggering in some browser environments
-        
+        e.stopImmediatePropagation(); 
         const micBtn = document.getElementById('voice-trigger-btn');
         if (micBtn) micBtn.click();
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [dataset]);
@@ -40,6 +55,7 @@ const Dashboard = () => {
     }
   }, [dataset]);
 
+  // --- UPDATED: SUBMIT & SAVE TO CLOUD ---
   const handleQuerySubmit = async (customQuery) => {
     const finalQuery = customQuery || query;
     if (!finalQuery || !dataset) return;
@@ -49,8 +65,24 @@ const Dashboard = () => {
     
     if (config) {
       setActiveConfig(config);
-      setHistory(prev => [config, ...prev.filter(h => h.title !== config.title)].slice(0, 8));
       setQuery(""); 
+
+      // Save to Supabase
+      const { data, error } = await supabase
+        .from('insights')
+        .insert([{
+          title: config.title,
+          config: config, // Store the whole object in JSONB column
+          reasoning: config.reasoning,
+          is_forecast: config.isForecast || false
+        }])
+        .select();
+
+      if (!error && data) {
+        setHistory(prev => [data[0], ...prev].slice(0, 10));
+      } else {
+        console.error("Supabase Save Error:", error);
+      }
     }
     setIsLoading(false);
   };
@@ -88,19 +120,22 @@ const Dashboard = () => {
           {history.length > 0 && (
             <div>
               <div className="text-[10px] font-bold text-slate-500 uppercase mb-4 px-4 flex justify-between">
-                <span>Recent Insights</span>
+                <span>Cloud History</span>
                 <span className="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px]">{history.length}</span>
               </div>
               <div className="space-y-2 px-2">
                 {history.map((item, idx) => (
                   <button 
-                    key={idx}
-                    onClick={() => setActiveConfig(item)}
-                    className={`w-full text-left p-3 rounded-xl text-xs group transition-all border ${activeConfig === item ? 'bg-white/10 border-white/20 text-white' : 'border-transparent hover:bg-white/5 text-slate-400'}`}
+                    key={item.id || idx}
+                    onClick={() => setActiveConfig(item.config || item)}
+                    className={`w-full text-left p-3 rounded-xl text-xs group transition-all border ${activeConfig?.title === item.title ? 'bg-white/10 border-white/20 text-white' : 'border-transparent hover:bg-white/5 text-slate-400'}`}
                   >
                     <div className="flex items-center gap-2 truncate font-semibold">
-                      <div className={`w-1.5 h-1.5 rounded-full ${item.isForecast ? 'bg-amber-500 animate-pulse' : 'bg-blue-500'}`} />
+                      <div className={`w-1.5 h-1.5 rounded-full ${item.is_forecast ? 'bg-amber-500 animate-pulse' : 'bg-blue-500'}`} />
                       {item.title}
+                    </div>
+                    <div className="text-[9px] text-slate-500 mt-1 pl-3.5">
+                       {new Date(item.created_at).toLocaleDateString()}
                     </div>
                   </button>
                 ))}
