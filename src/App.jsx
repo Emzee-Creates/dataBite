@@ -1,15 +1,21 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  Upload, Send, Database, BarChart3, X, Sparkles, Download, LayoutDashboard, 
-  Search, ShieldCheck, ChevronRight, List, Layers, Keyboard
+  Upload, Send, Database, BarChart3, X, Sparkles, Download, 
+  Search, ChevronRight, Layers, LogOut, LogIn, Menu
 } from 'lucide-react';
 import html2canvas from 'html2canvas';
+
+// COMPONENTS
 import FileUploader from './components/FileUploader';
 import DataTable from './components/DataTable';
 import Visualizer from './components/Visualizer';
 import VoiceInterface from './components/VoiceInterface';
+
+// UTILS
 import { generateChartConfig, getDiscoverySuggestions } from './utils/aiLogic';
-import { supabase } from './utils/supabaseClient'; // Ensure this file exists
+import { generateDataProfile } from './utils/dataProfiler'; 
+import { supabase } from './utils/supabaseClient';
+import { initDuckDB, runQuery } from './utils/duckdb'; 
 
 const Dashboard = () => {
   const [dataset, setDataset] = useState(null);
@@ -17,242 +23,362 @@ const Dashboard = () => {
   const [activeConfig, setActiveConfig] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [history, setHistory] = useState([]);
+  const [historySearch, setHistorySearch] = useState("");
   const [suggestions, setSuggestions] = useState([]);
+  const [user, setUser] = useState(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false); // Mobile Menu State
 
-  // --- NEW: FETCH HISTORY FROM SUPABASE ON LOAD ---
+  // --- 1. DATASET PERSISTENCE ---
   useEffect(() => {
-    const fetchHistory = async () => {
-      const { data, error } = await supabase
-        .from('insights')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(10);
-      
-      if (error) console.error("Error fetching history:", error);
-      else if (data) setHistory(data);
-    };
-
-    fetchHistory();
-  }, []);
-
-  // --- KEYBOARD LOGIC ---
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT' && dataset) {
-        e.preventDefault(); 
-        e.stopImmediatePropagation(); 
-        const micBtn = document.getElementById('voice-trigger-btn');
-        if (micBtn) micBtn.click();
+    const cachedDataset = localStorage.getItem('active_dataset');
+    if (cachedDataset) {
+      try {
+        const parsed = JSON.parse(cachedDataset);
+        setDataset(parsed);
+      } catch (e) {
+        console.error("Failed to parse cached dataset", e);
       }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [dataset]);
+    }
+  }, []);
 
   useEffect(() => {
     if (dataset) {
+      const { fileObject, ...metadata } = dataset;
+      localStorage.setItem('active_dataset', JSON.stringify(metadata));
       getDiscoverySuggestions(dataset.columns, dataset.rawData).then(setSuggestions);
     }
   }, [dataset]);
 
-  // --- UPDATED: SUBMIT & SAVE TO CLOUD ---
+  const handleClearDataset = () => {
+    setDataset(null);
+    localStorage.removeItem('active_dataset');
+    setActiveConfig(null);
+  };
+
+  // --- 2. AUTH & HISTORY ---
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      if (!user) {
+        setHistory([]);
+        return;
+      }
+      const { data, error } = await supabase
+        .from('insights')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(20);
+      if (!error && data) setHistory(data);
+    };
+    fetchHistory();
+  }, [user]);
+
+  const filteredHistory = history.filter(item => 
+    item.title?.toLowerCase().includes(historySearch.toLowerCase())
+  );
+
   const handleQuerySubmit = async (customQuery) => {
     const finalQuery = customQuery || query;
     if (!finalQuery || !dataset) return;
     
-    setIsLoading(true);
-    const config = await generateChartConfig(finalQuery, dataset.columns, dataset.rawData);
-    
-    if (config) {
-      setActiveConfig(config);
-      setQuery(""); 
-
-      // Save to Supabase
-      const { data, error } = await supabase
-        .from('insights')
-        .insert([{
-          title: config.title,
-          config: config, // Store the whole object in JSONB column
-          reasoning: config.reasoning,
-          is_forecast: config.isForecast || false
-        }])
-        .select();
-
-      if (!error && data) {
-        setHistory(prev => [data[0], ...prev].slice(0, 10));
-      } else {
-        console.error("Supabase Save Error:", error);
-      }
+    if (!dataset.fileObject) {
+      alert("Please re-upload your CSV to enable local SQL analysis.");
+      return;
     }
-    setIsLoading(false);
+
+    setIsSidebarOpen(false); // Auto-close sidebar on mobile
+    setIsLoading(true);
+    try {
+      const dataProfile = generateDataProfile(dataset.rawData, dataset.columns);
+      const aiBlueprint = await generateChartConfig(finalQuery, dataProfile, activeConfig);
+      
+      if (aiBlueprint && aiBlueprint.sql) {
+        await initDuckDB(dataset.fileObject); 
+        const queryResults = await runQuery(aiBlueprint.sql);
+
+        const finalConfig = {
+          ...aiBlueprint,
+          transformedData: queryResults.map(row => ({
+            ...row,
+            type: aiBlueprint.isForecast ? 'forecast' : 'actual'
+          })),
+          id: Date.now() 
+        };
+
+        setActiveConfig(finalConfig);
+        setQuery(""); 
+
+        if (user) {
+          const { data, error } = await supabase
+            .from('insights')
+            .insert([{
+              user_id: user.id,
+              title: finalConfig.title,
+              config: finalConfig,
+              reasoning: finalConfig.reasoning,
+              is_forecast: finalConfig.isForecast || false,
+            }])
+            .select();
+
+          if (!error && data) setHistory(prev => [data[0], ...prev]);
+        }
+      }
+    } catch (error) {
+      console.error("Analysis Failed:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const deleteInsight = async (id, e) => {
+    e.stopPropagation(); 
+    const { error } = await supabase.from('insights').delete().eq('id', id);
+    if (!error) {
+      setHistory(prev => prev.filter(item => item.id !== id));
+      if (activeConfig?.id === id) setActiveConfig(null);
+    }
   };
 
   const exportChart = async () => {
     const el = document.getElementById('chart-container');
-    const canvas = await html2canvas(el, { backgroundColor: '#ffffff', scale: 2 });
+    const canvas = await html2canvas(el, { backgroundColor: '#09090b', scale: 2 });
     const link = document.createElement('a');
     link.href = canvas.toDataURL("image/png");
-    link.download = "insight.png";
+    link.download = `${activeConfig?.title || 'insight'}.png`;
     link.click();
   };
 
   return (
-    <div className="flex h-screen bg-[#F1F5F9] text-slate-900 font-sans antialiased">
-      <aside className="w-72 bg-[#0F172A] text-slate-300 flex flex-col shadow-2xl shrink-0">
-        <div className="p-8 flex items-center gap-3">
-          <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center text-white shadow-lg">
+    <div className="flex flex-col lg:flex-row h-screen bg-[#09090b] text-slate-200 font-sans antialiased overflow-hidden">
+      
+      {/* MOBILE HEADER */}
+      <div className="lg:hidden h-16 px-6 bg-zinc-950 border-b border-white/10 flex items-center justify-between z-50">
+        <div className="flex items-center gap-2">
+           <BarChart3 size={20} className="text-amber-500" />
+           <span className="font-bold text-lg tracking-tighter text-white">data<span className="text-amber-500">Bite</span></span>
+        </div>
+        <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 text-slate-400">
+          {isSidebarOpen ? <X size={24} /> : <Menu size={24} />}
+        </button>
+      </div>
+
+      {/* SIDEBAR (Responsive Overlay) */}
+      <aside className={`
+        fixed inset-y-0 left-0 z-40 w-72 bg-zinc-950 border-r border-white/10 flex flex-col transition-transform duration-300 transform
+        lg:translate-x-0 lg:static lg:inset-auto
+        ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+      `}>
+        <div className="p-8 hidden lg:flex items-center gap-3">
+          <div className="w-10 h-10 bg-amber-500 rounded-xl flex items-center justify-center text-black shadow-[0_0_15px_rgba(245,158,11,0.2)]">
             <BarChart3 size={24} />
           </div>
-          <span className="font-bold text-xl tracking-tight text-white">dataBite</span>
+          <span className="font-bold text-xl tracking-tighter text-white">data<span className="text-amber-500">Bite</span></span>
         </div>
 
-        <nav className="flex-1 px-4 space-y-8 overflow-y-auto">
-          <div>
-            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 px-4">Workspace</div>
-            <button 
-              onClick={() => setActiveConfig(null)}
-              className={`w-full flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-xl transition-all ${!activeConfig ? 'bg-blue-600/10 text-blue-400 border border-blue-600/20' : 'hover:bg-white/5'}`}
-            >
-              <LayoutDashboard size={18} /> Overview
-            </button>
-          </div>
-
-          {history.length > 0 && (
-            <div>
-              <div className="text-[10px] font-bold text-slate-500 uppercase mb-4 px-4 flex justify-between">
-                <span>Cloud History</span>
-                <span className="bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded text-[8px]">{history.length}</span>
+        <nav className="flex-1 flex flex-col min-h-0 px-4 mt-16 lg:mt-0">
+          {user && (
+            <>
+              <div className="relative mb-6">
+                <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                <input 
+                  type="text"
+                  placeholder="Search history..."
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  className="w-full bg-white/[0.05] border border-white/10 rounded-lg py-2 pl-9 text-[10px] text-slate-300 focus:ring-1 focus:ring-amber-500 outline-none transition-all"
+                />
               </div>
-              <div className="space-y-2 px-2">
-                {history.map((item, idx) => (
-                  <button 
-                    key={item.id || idx}
-                    onClick={() => setActiveConfig(item.config || item)}
-                    className={`w-full text-left p-3 rounded-xl text-xs group transition-all border ${activeConfig?.title === item.title ? 'bg-white/10 border-white/20 text-white' : 'border-transparent hover:bg-white/5 text-slate-400'}`}
-                  >
-                    <div className="flex items-center gap-2 truncate font-semibold">
-                      <div className={`w-1.5 h-1.5 rounded-full ${item.is_forecast ? 'bg-amber-500 animate-pulse' : 'bg-blue-500'}`} />
-                      {item.title}
-                    </div>
-                    <div className="text-[9px] text-slate-500 mt-1 pl-3.5">
-                       {new Date(item.created_at).toLocaleDateString()}
-                    </div>
-                  </button>
+
+              <div className="flex-1 overflow-y-auto space-y-1 custom-scrollbar">
+                {filteredHistory.map((item) => (
+                  <div key={item.id} className="group relative">
+                    <button 
+                      onClick={() => {
+                        setActiveConfig(item.config);
+                        setIsSidebarOpen(false);
+                      }}
+                      className={`w-full text-left p-3 rounded-xl text-xs transition-all border ${
+                        activeConfig?.title === item.title 
+                        ? 'bg-amber-500/10 border-amber-500/30 text-amber-500' 
+                        : 'border-transparent text-slate-400 hover:bg-white/[0.03] hover:text-slate-100'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 truncate font-semibold">
+                        {item.is_forecast ? <Layers size={12} className="text-amber-500" /> : <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />}
+                        {item.title}
+                      </div>
+                    </button>
+                    <button onClick={(e) => deleteInsight(item.id, e)} className="absolute right-2 top-1/2 -translate-y-1/2 opacity-100 lg:opacity-0 lg:group-hover:opacity-100 text-slate-500 hover:text-red-400 p-2 transition-all">
+                      <X size={14} />
+                    </button>
+                  </div>
                 ))}
               </div>
-            </div>
+            </>
           )}
         </nav>
         
-        {dataset && (
-          <div className="p-6 mt-auto">
-            <div className="bg-white/5 rounded-2xl p-4 border border-white/10">
-               <div className="flex items-center gap-2 text-xs text-slate-400 font-medium">
-                 <kbd className="bg-slate-700 px-1.5 py-0.5 rounded text-white border-b-2 border-slate-900">Space</kbd>
-                 <span>Push to talk</span>
-               </div>
+        <div className="p-4 mt-auto border-t border-white/10 bg-white/[0.02]">
+          <button 
+            onClick={() => user ? supabase.auth.signOut() : supabase.auth.signInWithOAuth({ provider: 'github' })}
+            className="w-full flex items-center gap-3 p-3 rounded-xl bg-white/[0.05] hover:bg-white/[0.08] transition-all border border-white/10 group"
+          >
+            {user ? (
+              <img src={user.user_metadata.avatar_url} className="w-8 h-8 rounded-lg border border-amber-500/30" alt="avatar" />
+            ) : (
+              <div className="w-8 h-8 rounded-lg bg-zinc-800 flex items-center justify-center text-slate-400 border border-white/10">
+                <Database size={14} />
+              </div>
+            )}
+            <div className="flex-1 text-left truncate">
+              <p className="text-[11px] font-bold text-white truncate">{user ? user.user_metadata.full_name : "Guest Mode"}</p>
+              <p className="text-[9px] text-amber-500/70 uppercase font-black tracking-widest">{user ? "Pro Access" : "Sign In"}</p>
             </div>
-          </div>
-        )}
+            {user ? <LogOut size={14} className="text-slate-500 group-hover:text-amber-500" /> : <LogIn size={14} className="text-amber-500" />}
+          </button>
+        </div>
       </aside>
 
-      <main className="flex-1 flex flex-col relative overflow-hidden">
-        <header className="h-20 bg-white/50 backdrop-blur-xl border-b flex items-center justify-between px-10 sticky top-0 z-10 shrink-0">
-          <h1 className="text-sm font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-            Explorer <ChevronRight size={14} /> <span className="text-slate-900">{dataset?.name || 'Waiting...'}</span>
+      {/* MAIN CONTENT AREA */}
+      <main className="flex-1 flex flex-col relative bg-zinc-900 overflow-hidden">
+        <header className="hidden lg:flex h-16 border-b border-white/10 items-center justify-between px-10 bg-zinc-950/50 backdrop-blur-md sticky top-0 z-30">
+          <h1 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] flex items-center gap-2">
+            Explorer <ChevronRight size={12} className="text-amber-500" /> <span className="text-slate-100">{dataset?.name || 'Awaiting Data'}</span>
           </h1>
-          {!dataset && (
-            <label htmlFor="file-upload" className="flex items-center gap-2 bg-slate-900 text-white px-6 py-2.5 rounded-xl text-sm font-bold cursor-pointer shadow-lg active:scale-95">
-              <Upload size={18} /> Import Dataset
-            </label>
+          {dataset && (
+            <button onClick={handleClearDataset} className="text-[9px] font-black text-slate-500 hover:text-red-400 transition-all uppercase tracking-widest px-3 py-1.5 rounded-lg border border-white/5 hover:border-red-500/20 bg-white/[0.02]">
+              Unload File
+            </button>
           )}
         </header>
 
-        <section className="flex-1 p-10 overflow-y-auto">
+        <section className="flex-1 p-4 md:p-10 overflow-y-auto pb-44 lg:pb-32">
           {!dataset ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto">
-              <div className="w-20 h-20 bg-white rounded-3xl border flex items-center justify-center mb-6">
-                <Search size={32} className="text-slate-300" />
-              </div>
-              <h2 className="text-2xl font-bold text-slate-800 mb-2">Connect your data</h2>
+            <div className="h-full flex items-center justify-center">
               <FileUploader onDataLoaded={setDataset} />
             </div>
           ) : (
-            <div className="w-full max-w-6xl mx-auto h-full">
+            <div className="w-full max-w-6xl mx-auto">
               {activeConfig ? (
-                <div className="h-[calc(100vh-220px)] flex flex-col animate-in fade-in zoom-in-95 duration-500">
-                  <div className="bg-white flex-1 rounded-[2.5rem] border shadow-2xl overflow-hidden flex flex-col">
-                    <div className="p-8 border-b flex justify-between items-center bg-white/50">
-                      <div className="flex items-center gap-4">
-                        <div className="w-12 h-12 bg-blue-50 rounded-2xl flex items-center justify-center text-blue-600"><Sparkles size={24} /></div>
-                        <div>
-                          <h3 className="font-bold text-2xl text-slate-800">{activeConfig.title}</h3>
-                          {activeConfig.isForecast && (
-                            <span className="mt-1 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-50 text-amber-600 text-[10px] font-bold uppercase ring-1 ring-amber-200">
-                              <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" /> Forecast Active
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <button onClick={exportChart} className="flex items-center gap-2 text-xs font-bold text-slate-600 bg-white px-6 py-3 rounded-xl border shadow-sm">
-                          <Download size={18} /> Export Image
-                        </button>
-                        <button onClick={() => setActiveConfig(null)} className="p-3 text-slate-400 hover:text-red-500 transition-all"><X size={24} /></button>
+                <div className="bg-zinc-950 border border-white/10 rounded-3xl lg:rounded-[2.5rem] overflow-hidden shadow-xl animate-in fade-in zoom-in-95 duration-500">
+                  <div className="p-5 lg:p-8 border-b border-white/5 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white/[0.01]">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 lg:w-12 lg:h-12 bg-amber-500/10 rounded-xl lg:rounded-2xl flex items-center justify-center text-amber-500 border border-amber-500/20"><Sparkles size={20} /></div>
+                      <div>
+                        <h3 className="font-bold text-lg lg:text-2xl text-white tracking-tight">{activeConfig.title}</h3>
+                        {activeConfig.isForecast && (
+                          <span className="mt-1 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-500 text-[9px] font-bold uppercase border border-amber-500/20">
+                            Predictive
+                          </span>
+                        )}
                       </div>
                     </div>
-                    <div className="flex-1 p-10 min-h-0">
-                      <div id="chart-container" className="w-full h-full">
-                        <Visualizer config={activeConfig} />
-                      </div>
+                    <div className="flex items-center gap-3 w-full sm:w-auto">
+                      <button onClick={exportChart} className="flex-1 sm:flex-none px-4 py-2.5 border border-white/10 text-slate-300 text-[9px] font-bold rounded-xl hover:bg-white hover:text-black transition-all uppercase tracking-widest">
+                        <Download size={14} className="inline mr-2" /> Export
+                      </button>
+                      <button onClick={() => setActiveConfig(null)} className="p-2 text-slate-500 hover:text-white"><X size={24} /></button>
                     </div>
-                    <div className="p-8 bg-slate-50 border-t shrink-0">
-                       <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">AI Reasoning</p>
-                       <p className="text-sm text-slate-600 italic leading-relaxed">"{activeConfig.reasoning}"</p>
+                  </div>
+                  <div className="p-4 lg:p-10 h-[300px] lg:h-[450px]">
+                    <div id="chart-container" className="w-full h-full">
+                      <Visualizer config={activeConfig} />
                     </div>
+                  </div>
+                  <div className="p-6 lg:p-8 bg-amber-500/5 border-t border-amber-500/10">
+                     <p className="text-amber-500 text-[9px] font-black uppercase mb-2 tracking-[0.2em]">Analyst Narrative</p>
+                     <p className="text-slate-300 italic leading-relaxed text-xs lg:text-sm">"{activeConfig.reasoning}"</p>
                   </div>
                 </div>
               ) : (
-                <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-32">
-                  <div className="grid grid-cols-3 gap-6">
-                    {suggestions.map((s, i) => (
-                      <button key={i} onClick={() => handleQuerySubmit(s)} className="bg-white p-6 rounded-[2rem] border hover:border-blue-300 hover:shadow-lg transition-all text-left group">
-                        <p className="text-sm font-bold text-slate-600 leading-relaxed pr-6">"{s}"</p>
-                      </button>
-                    ))}
+                <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4">
+                  <div className="space-y-6">
+                    <div className="flex items-center gap-3">
+                      <div className="h-px flex-1 bg-white/5"></div>
+                      <h2 className="text-[10px] font-black text-amber-500/60 uppercase tracking-[0.3em] flex items-center gap-2">
+                        <Sparkles size={12} /> Suggestions
+                      </h2>
+                      <div className="h-px flex-1 bg-white/5"></div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {suggestions.map((s, i) => (
+                        <button 
+                          key={i} 
+                          onClick={() => handleQuerySubmit(s)} 
+                          className="bg-white/[0.02] border border-white/5 p-5 lg:p-6 rounded-2xl lg:rounded-[1.5rem] hover:border-amber-500/40 hover:bg-white/[0.04] transition-all text-left group"
+                        >
+                          <p className="text-xs font-bold text-slate-400 group-hover:text-slate-100 leading-relaxed transition-colors">"{s}"</p>
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <DataTable data={dataset.rawData} columns={dataset.columns} />
+
+                  <div className="space-y-6">
+                    <div className="flex items-center gap-3">
+                      <div className="h-px flex-1 bg-white/5"></div>
+                      <h2 className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em]">
+                         Raw Data Preview
+                      </h2>
+                      <div className="h-px flex-1 bg-white/5"></div>
+                    </div>
+                    <div className="w-full overflow-hidden">
+                       <DataTable data={dataset.rawData} columns={dataset.columns} />
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
           )}
         </section>
 
-        <div className={`absolute bottom-10 left-1/2 -translate-x-1/2 w-full max-w-4xl px-6 flex items-center gap-4 transition-all duration-500 z-20 ${!dataset ? 'opacity-0 translate-y-10 pointer-events-none' : 'opacity-100 translate-y-0'}`}>
-          <VoiceInterface 
-            onCommandReceived={(cmd) => handleQuerySubmit(cmd)} 
-            lastResponse={activeConfig?.reasoning} 
-          />
-
-          <div className="flex-1 bg-[#0F172A] border border-white/10 rounded-[2rem] shadow-2xl p-3 flex items-center gap-4 focus-within:ring-4 focus-within:ring-blue-500/20 group">
-            <div className="pl-4 text-blue-500 group-focus-within:animate-pulse"><Sparkles size={20} /></div>
-            <input 
-              type="text" 
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleQuerySubmit()}
-              placeholder="Ask for a forecast or use the microphone..."
-              className="flex-1 bg-transparent border-none outline-none text-white px-2 py-4 text-sm placeholder:text-slate-500"
-            />
-            <button 
-              onClick={() => handleQuerySubmit()}
-              disabled={isLoading || !query}
-              className="px-8 py-4 bg-blue-600 text-white rounded-[1.5rem] font-bold text-sm hover:bg-blue-500 disabled:bg-slate-800 transition-all flex items-center gap-2"
-            >
-              {isLoading ? <div className="w-5 h-5 border-2 border-t-white rounded-full animate-spin" /> : <>Process <Send size={16} /></>}
-            </button>
+        {/* PERSISTENT BOTTOM CONTROL BAR */}
+        {dataset && (
+          <div className="fixed lg:absolute bottom-0 left-0 right-0 p-4 lg:p-8 bg-gradient-to-t from-zinc-950 via-zinc-950/90 to-transparent z-40">
+            <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center gap-2 sm:gap-4 bg-zinc-800/90 backdrop-blur-xl border border-white/10 p-2 pl-4 rounded-3xl lg:rounded-[2rem] shadow-2xl">
+              <div className="flex items-center w-full sm:w-auto gap-3">
+                <VoiceInterface 
+                  onCommandReceived={handleQuerySubmit} 
+                  lastResponse={activeConfig?.reasoning} 
+                  isChartActive={!!activeConfig}
+                />
+                <div className="hidden sm:block w-[1px] h-8 bg-white/10" />
+                <input 
+                  type="text" 
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleQuerySubmit()}
+                  placeholder="Ask for an insight..."
+                  className="flex-1 sm:hidden lg:flex bg-transparent border-none outline-none text-white px-2 py-3 text-sm placeholder:text-slate-500 font-medium"
+                />
+              </div>
+              <input 
+                type="text" 
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleQuerySubmit()}
+                placeholder="Ask for an insight..."
+                className="hidden sm:flex lg:hidden flex-1 bg-transparent border-none outline-none text-white px-2 py-3 text-sm placeholder:text-slate-500 font-medium"
+              />
+              <button 
+                onClick={() => handleQuerySubmit()}
+                disabled={isLoading || !query}
+                className="w-full sm:w-auto bg-amber-500 text-black px-6 lg:px-8 py-3 lg:py-3.5 rounded-2xl lg:rounded-[1.5rem] font-black text-[10px] hover:bg-amber-400 disabled:bg-zinc-700 disabled:text-slate-500 transition-all flex items-center justify-center gap-2 uppercase tracking-widest"
+              >
+                {isLoading ? <div className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" /> : <><Send size={14}/> Analyze</>}
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </main>
     </div>
   );
